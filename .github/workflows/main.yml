@@ -1,0 +1,61 @@
+name: RDP - 2026
+
+on:
+  workflow_dispatch:
+    inputs:
+      windows_version:
+        description: 'Choose Windows version'
+        required: true
+        default: 'windows-latest'
+        type: choice
+        options:
+          - windows-latest
+          - windows-2022
+          - windows-2019
+
+jobs:
+  secure-rdp:
+    runs-on: ${{ github.event.inputs.windows_version }}
+    timeout-minutes: 360
+
+    steps:
+      - name: System Preparation
+        shell: powershell
+        run: |
+          # Use single quotes to prevent PowerShell from interpreting special characters
+          $user = '${{ secrets.RDP_USERNAME }}'
+          $pass = '${{ secrets.RDP_PASSWORD }}'
+          
+          # Convert to secure string using the variables
+          $securePass = ConvertTo-SecureString $pass -AsPlainText -Force
+          
+          # Check and create user safely
+          if (-not (Get-LocalUser -Name $user -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $user -Password $securePass -Description "RDP Access User"
+            Add-LocalGroupMember -Group "Administrators" -Member $user
+          }
+          
+          # Correct way to set Environment Variables without parsing errors
+          "RDP_USERNAME=$user" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="gh-rdp-${{ github.run_id }}"
+          $tsIp = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          "TAILSCALE_IP=$tsIp" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Install MT5
+        shell: powershell
+        run: |
+          Invoke-WebRequest -Uri "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe" -OutFile "$env:TEMP\mt5setup.exe"
+          Start-Process -FilePath "$env:TEMP\mt5setup.exe" -ArgumentList "/auto" -Wait
+
+      - name: Keep Alive
+        shell: powershell
+        run: |
+          $endTime = (Get-Date).AddHours(6)
+          while ((Get-Date) -lt $endTime) { Start-Sleep -Seconds 60 }
