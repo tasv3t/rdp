@@ -82,6 +82,8 @@ jobs:
 
       # ---------------------------------------------------------------
       # 4. Install Tailscale and join the tailnet
+      #    Ephemerality is configured on the auth key in the Tailscale
+      #    admin panel -- there is no --ephemeral CLI flag.
       # ---------------------------------------------------------------
       - name: Install Tailscale
         shell: powershell
@@ -95,7 +97,7 @@ jobs:
           Start-Process msiexec.exe -ArgumentList "/i","`"$msi`"","/quiet","/norestart" -Wait
 
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          & $ts up --authkey=$env:TS_AUTHKEY --hostname="gh-rdp-${{ github.run_id }}" --ephemeral
+          & $ts up --authkey=$env:TS_AUTHKEY --hostname="gh-rdp-${{ github.run_id }}"
 
           $tsIp = (& $ts ip -4 | Select-Object -First 1).Trim()
           "TAILSCALE_IP=$tsIp" | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -117,8 +119,7 @@ jobs:
           "MT5_PATH=C:\MT5" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       # ---------------------------------------------------------------
-      # 6. Block MT5 auto-update popup
-      #    (must run BEFORE MT5 is launched)
+      # 6. Block MT5 auto-update popup (run BEFORE MT5 is launched)
       # ---------------------------------------------------------------
       - name: Block MT5 Auto-Update
         shell: powershell
@@ -148,7 +149,6 @@ jobs:
       # ---------------------------------------------------------------
       # 7. Install EA into the portable data folder
       #    Source: file committed to this repo at ea/MyEA.ex5
-      #    (See notes below to swap for a Release asset download.)
       # ---------------------------------------------------------------
       - name: Install EA
         shell: powershell
