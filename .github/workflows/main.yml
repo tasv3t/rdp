@@ -13,18 +13,6 @@ on:
           - windows-2022
           - windows-2019
 
-      install_ea:
-        description: 'Install EA (MyEA.ex5 from repo)'
-        required: false
-        default: false
-        type: boolean
-
-      ea_path:
-        description: 'Path to EA file in repo (only used if install_ea is checked)'
-        required: false
-        default: 'ea\MyEA.ex5'
-        type: string
-
 permissions:
   contents: read
 
@@ -34,6 +22,7 @@ concurrency:
 
 jobs:
   secure-rdp:
+    name: Secure RDP
     runs-on: ${{ github.event.inputs.windows_version }}
     timeout-minutes: 360
 
@@ -90,7 +79,7 @@ jobs:
             -LocalPort 3389 -RemoteAddress 100.64.0.0/10
 
       # ---------------------------------------------------------------
-      # 3. Tailscale
+      # 3. Tailscale  (auth key via env, not command line)
       # ---------------------------------------------------------------
       - name: Install Tailscale
         shell: powershell
@@ -111,7 +100,7 @@ jobs:
           Write-Host "RDP ready at: $tsIp (user: $env:RDP_USERNAME)"
 
       # ---------------------------------------------------------------
-      # 4. Install MT5 (portable)
+      # 4. Install MT5 (portable) with path fallback
       # ---------------------------------------------------------------
       - name: Install MT5
         shell: powershell
@@ -124,9 +113,11 @@ jobs:
 
             $path = "C:\MT5"
             if (-not (Test-Path "$path\terminal64.exe")) {
-              $found = Get-ChildItem "$env:APPDATA\MetaQuotes\Terminal" -Recurse -Filter terminal64.exe -ErrorAction SilentlyContinue |
+              $found = Get-ChildItem "$env:APPDATA\MetaQuotes\Terminal" -Recurse `
+                        -Filter terminal64.exe -ErrorAction SilentlyContinue |
                        Select-Object -First 1
-              if ($found) { $path = $found.Directory.FullName } else { throw "terminal64.exe not found after install." }
+              if ($found) { $path = $found.Directory.FullName }
+              else { throw "terminal64.exe not found after install." }
             }
 
             "MT5_PATH=$path" | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -138,7 +129,7 @@ jobs:
           }
 
       # ---------------------------------------------------------------
-      # 5. Block auto-update (only if MT5 installed)
+      # 5. Block MT5 Auto-Update
       # ---------------------------------------------------------------
       - name: Block MT5 Auto-Update
         shell: powershell
@@ -172,39 +163,7 @@ jobs:
           }
 
       # ---------------------------------------------------------------
-      # 6. Install EA  (ONLY if install_ea == true)
-      # ---------------------------------------------------------------
-      - name: Install EA
-        shell: powershell
-        continue-on-error: true
-        if: ${{ github.event.inputs.install_ea == 'true' && env.MT5_PATH != '' }}
-        env:
-          EA_SRC: ${{ github.event.inputs.ea_path }}
-        run: |
-          try {
-            $src = $env:EA_SRC
-            if (-not (Test-Path $src)) { throw "EA not found at $src." }
-
-            $item = Get-Item $src
-            if ($item.Length -lt 10KB) {
-              throw "EA file looks like a Git-LFS pointer, not a binary ($($item.Length) bytes)."
-            }
-
-            $dstDir = "$env:MT5_PATH\MQL5\Experts"
-            New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
-            Copy-Item $src -Destination $dstDir -Force
-
-            $eaName = [System.IO.Path]::GetFileName($src)
-            "EA_NAME=$eaName" | Out-File -FilePath $env:GITHUB_ENV -Append
-            Write-Host "EA installed: $dstDir\$eaName"
-          }
-          catch {
-            Write-Warning "EA install failed: $_"
-            "EA_NAME=" | Out-File -FilePath $env:GITHUB_ENV -Append
-          }
-
-      # ---------------------------------------------------------------
-      # 7. MT5 config (login + optional EA startup)
+      # 6. Create MT5 Config (login only)
       # ---------------------------------------------------------------
       - name: Create MT5 Config
         shell: powershell
@@ -229,18 +188,12 @@ jobs:
               "Password=$env:MT5_PASSWORD"
               "Server=$env:MT5_SERVER"
               "AutoConfiguration=false"
+              ""
+              "[Experts]"
+              "AllowLiveTrading=1"
+              "AllowDllImport=0"
+              "Enabled=1"
             )
-
-            if ($env:EA_NAME) {
-              $lines += ""
-              $lines += "[StartUp]"
-              $lines += "Expert=Experts\$env:EA_NAME"
-              $lines += "Symbol=$env:MT5_SYMBOL"
-              $lines += "Period=$env:MT5_PERIOD"
-              Write-Host "Config: EA startup enabled for $env:EA_NAME"
-            } else {
-              Write-Host "Config: login only (no EA)."
-            }
 
             $autoIni = "$configDir\auto.ini"
             $lines | Set-Content -Path $autoIni -Encoding Unicode
@@ -254,7 +207,7 @@ jobs:
           }
 
       # ---------------------------------------------------------------
-      # 8. Launch MT5
+      # 7. Launch MT5
       # ---------------------------------------------------------------
       - name: Launch MT5
         shell: powershell
@@ -273,11 +226,15 @@ jobs:
 
             if (Get-Process terminal64 -ErrorAction SilentlyContinue) {
               Write-Host "MT5 launched."
-            } else {
+            }
+            else {
               Write-Warning "MT5 process not detected."
             }
 
-            Remove-Item $env:MT5_CONFIG -Force -ErrorAction SilentlyContinue
+            # Remove config that contains plaintext password
+            if ($env:MT5_CONFIG) {
+              Remove-Item $env:MT5_CONFIG -Force -ErrorAction SilentlyContinue
+            }
           }
           catch {
             Write-Warning "MT5 launch failed: $_"
@@ -285,45 +242,7 @@ jobs:
           }
 
       # ---------------------------------------------------------------
-      # 9. Verify EA (only if install_ea == true and EA installed)
-      # ---------------------------------------------------------------
-      - name: Verify EA Attached
-        shell: powershell
-        continue-on-error: true
-        if: ${{ github.event.inputs.install_ea == 'true' && env.MT5_PATH != '' && env.EA_NAME != '' }}
-        run: |
-          try {
-            $deadline = (Get-Date).AddMinutes(5)
-            $logs = @()
-            while ((Get-Date) -lt $deadline) {
-              $logs  = @()
-              $logs += Get-ChildItem "$env:MT5_PATH\Logs"      -Filter *.log -ErrorAction SilentlyContinue
-              $logs += Get-ChildItem "$env:MT5_PATH\MQL5\Logs" -Filter *.log -ErrorAction SilentlyContinue
-              if ($logs.Count -gt 0) { break }
-              Start-Sleep -Seconds 15
-            }
-
-            if ($logs.Count -eq 0) {
-              Write-Warning "No MT5 logs after 5 minutes - EA may not have started."
-            } else {
-              $combined = ($logs | ForEach-Object {
-                Get-Content -LiteralPath $_.FullName -Raw -ErrorAction SilentlyContinue
-              }) -join "`n"
-
-              if ($combined -match "unknown symbol|cannot find symbol|symbol not found") {
-                Write-Warning "MT5 rejected symbol '$env:MT5_SYMBOL'."
-              } elseif ($combined -match [regex]::Escape($env:EA_NAME)) {
-                Write-Host "EA verification passed."
-              } else {
-                Write-Warning "EA '$env:EA_NAME' not seen in logs."
-              }
-            }
-          }
-          catch { Write-Warning "Verification error: $_" }
-          exit 0
-
-      # ---------------------------------------------------------------
-      # 10. RDP info
+      # 8. RDP info (always)
       # ---------------------------------------------------------------
       - name: RDP Info
         shell: powershell
@@ -336,20 +255,12 @@ jobs:
           Write-Host " Username     : $env:RDP_USERNAME"
           Write-Host " Port         : 3389"
           Write-Host "=========================================="
-          if ($env:MT5_PATH) {
-            Write-Host " MT5       : $env:MT5_PATH"
-          } else {
-            Write-Host " MT5       : not installed (skipped)"
-          }
-          if ($env:EA_NAME) {
-            Write-Host " EA        : $env:EA_NAME"
-          } else {
-            Write-Host " EA        : not installed"
-          }
+          if ($env:MT5_PATH) { Write-Host " MT5          : $env:MT5_PATH" }
+          else                { Write-Host " MT5          : not installed (skipped)" }
           Write-Host "=========================================="
 
       # ---------------------------------------------------------------
-      # 11. Keep alive
+      # 9. Keep alive (~5h30m, safely under 6h timeout)
       # ---------------------------------------------------------------
       - name: Keep Alive
         shell: powershell
