@@ -25,10 +25,6 @@ jobs:
     runs-on: ${{ github.event.inputs.windows_version }}
     timeout-minutes: 360
 
-    env:
-      MT5_SYMBOL: XAUUSD
-      MT5_PERIOD: M1
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -53,12 +49,10 @@ jobs:
 
           if (-not (Get-LocalUser -Name $user -ErrorAction SilentlyContinue)) {
             New-LocalUser -Name $user -Password $securePass `
-              -Description "RDP Access User" -PasswordNeverExpires
+              -Description "RDP Access User" -PasswordNeverExpires -AccountNeverExpires
           }
 
-          if (-not (Get-LocalGroupMember -Group "Administrators" -Member $user -ErrorAction SilentlyContinue)) {
-            Add-LocalGroupMember -Group "Administrators" -Member $user
-          }
+          Add-LocalGroupMember -Group "Administrators" -Member $user -ErrorAction SilentlyContinue
 
           "RDP_USERNAME=$user" | Out-File -FilePath $env:GITHUB_ENV -Append
 
@@ -76,6 +70,8 @@ jobs:
           New-NetFirewallRule -Name "RDP-Tailscale" -DisplayName "RDP over Tailscale" `
             -Enabled True -Direction Inbound -Protocol TCP -Action Allow `
             -LocalPort 3389 -RemoteAddress 100.64.0.0/10
+
+          Restart-Service TermService -Force
 
       # ---------------------------------------------------------------
       # 3. Tailscale
@@ -102,17 +98,27 @@ jobs:
       # 4. Install MT5 (portable)
       # ---------------------------------------------------------------
       - name: Install MT5
+        id: mt5
         shell: powershell
         continue-on-error: true
         run: |
           try {
             $installer = "$env:TEMP\mt5setup.exe"
             Invoke-WebRequest -Uri "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe" -OutFile $installer
-            Start-Process -FilePath $installer -ArgumentList "/auto","/path:`"C:\MT5`"" -Wait
+
+            Start-Process -FilePath $installer -ArgumentList "/auto","/path:`"C:\MT5`""
+
+            $deadline = (Get-Date).AddMinutes(5)
+            while ((Get-Date) -lt $deadline -and -not (Test-Path "C:\MT5\terminal64.exe")) {
+              Start-Sleep -Seconds 10
+            }
 
             if (-not (Test-Path "C:\MT5\terminal64.exe")) {
               throw "terminal64.exe not found after install."
             }
+
+            Get-Process terminal64 -ErrorAction SilentlyContinue | Stop-Process -Force
+
             "MT5_PATH=C:\MT5" | Out-File -FilePath $env:GITHUB_ENV -Append
             Write-Host "MT5 installed at C:\MT5"
           }
@@ -131,16 +137,10 @@ jobs:
         run: |
           try {
             $deny = New-Object System.Security.AccessControl.FileSystemAccessRule(
-              "Everyone", "Write", "Deny")
+              "Everyone","Write","ContainerInherit,ObjectInherit","None","Deny")
 
             function Block-Path($p) {
-              if (Test-Path $p) {
-                if ((Get-Item $p).PSIsContainer) {
-                  Remove-Item "$p\*" -Recurse -Force -ErrorAction SilentlyContinue
-                  Remove-Item $p -Force -ErrorAction SilentlyContinue
-                }
-              }
-              New-Item -ItemType File -Path $p -Force | Out-Null
+              New-Item -ItemType Directory -Path $p -Force | Out-Null
               $acl = Get-Acl $p
               $acl.SetAccessRuleProtection($true, $false)
               $acl.AddAccessRule($deny)
@@ -156,31 +156,7 @@ jobs:
           }
 
       # ---------------------------------------------------------------
-      # 6. Install EA (skip if MT5 missing or EA file missing)
-      # ---------------------------------------------------------------
-      - name: Install EA
-        shell: powershell
-        continue-on-error: true
-        if: env.MT5_PATH != ''
-        run: |
-          try {
-            $src = "ea\MyEA.ex5"
-            if (-not (Test-Path $src)) {
-              throw "EA not found at $src."
-            }
-
-            $dstDir = "$env:MT5_PATH\MQL5\Experts"
-            New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
-            Copy-Item $src -Destination $dstDir -Force
-            Write-Host "EA installed at $dstDir\MyEA.ex5"
-          }
-          catch {
-            Write-Warning "EA install failed: $_"
-            Write-Warning "Continuing without EA."
-          }
-
-      # ---------------------------------------------------------------
-      # 7. MT5 config (skip if MT5 missing)
+      # 6. MT5 config (login only, no EA)
       # ---------------------------------------------------------------
       - name: Create MT5 Config
         shell: powershell
@@ -206,11 +182,6 @@ jobs:
               "Password=$env:MT5_PASSWORD"
               "Server=$env:MT5_SERVER"
               "AutoConfiguration=false"
-              ""
-              "[StartUp]"
-              "Expert=Experts\MyEA.ex5"
-              "Symbol=$env:MT5_SYMBOL"
-              "Period=$env:MT5_PERIOD"
             ) | Set-Content -Path $autoIni -Encoding Unicode
 
             $commonIni = "$configDir\common.ini"
@@ -229,7 +200,7 @@ jobs:
           }
 
       # ---------------------------------------------------------------
-      # 8. Launch MT5 (never fail the job)
+      # 7. Launch MT5 (never fail the job)
       # ---------------------------------------------------------------
       - name: Launch MT5
         shell: powershell
@@ -249,7 +220,7 @@ jobs:
             if (Get-Process terminal64 -ErrorAction SilentlyContinue) {
               Write-Host "MT5 launched."
             } else {
-              Write-Warning "MT5 process not detected - will verify in next step."
+              Write-Warning "MT5 process not detected."
             }
           }
           catch {
@@ -258,65 +229,7 @@ jobs:
           }
 
       # ---------------------------------------------------------------
-      # 9. Verify EA - WARN ONLY, NEVER FAILS THE JOB
-      # ---------------------------------------------------------------
-      - name: Verify EA Attached
-        shell: powershell
-        continue-on-error: true
-        if: env.MT5_PATH != ''
-        run: |
-          $ok = $false
-
-          try {
-            $deadline = (Get-Date).AddMinutes(5)
-            $logs = @()
-
-            while ((Get-Date) -lt $deadline) {
-              $logs  = @()
-              $logs += Get-ChildItem "$env:MT5_PATH\Logs"      -Filter *.log -ErrorAction SilentlyContinue
-              $logs += Get-ChildItem "$env:MT5_PATH\MQL5\Logs" -Filter *.log -ErrorAction SilentlyContinue
-              if ($logs.Count -gt 0) { break }
-              Start-Sleep -Seconds 15
-            }
-
-            if ($logs.Count -eq 0) {
-              Write-Warning "No MT5 logs after 5 minutes - EA/terminal may not have started."
-            }
-            else {
-              foreach ($log in ($logs | Sort-Object LastWriteTime -Descending | Select-Object -First 3)) {
-                Write-Host "----- $($log.FullName) (last 40 lines) -----"
-                Get-Content -LiteralPath $log.FullName -Tail 40
-              }
-
-              $combined = ($logs | ForEach-Object {
-                Get-Content -LiteralPath $_.FullName -Raw -ErrorAction SilentlyContinue
-              }) -join "`n"
-
-              if ($combined -match "unknown symbol|cannot find symbol|symbol not found") {
-                Write-Warning "MT5 rejected symbol '$env:MT5_SYMBOL'. EA may not run."
-              }
-              elseif ($combined -match "MyEA") {
-                Write-Host "EA verification passed."
-                $ok = $true
-              }
-              else {
-                Write-Warning "EA 'MyEA' not seen in logs - may not have attached."
-              }
-            }
-          }
-          catch {
-            Write-Warning "Verification step error: $_"
-          }
-
-          if (-not $ok) {
-            Write-Warning "EA verification did not pass - RDP continues normally."
-          }
-
-          # Always exit 0
-          exit 0
-
-      # ---------------------------------------------------------------
-      # 10. Always print RDP info right before keep-alive
+      # 8. RDP info
       # ---------------------------------------------------------------
       - name: RDP Info
         shell: powershell
@@ -336,13 +249,13 @@ jobs:
           }
 
       # ---------------------------------------------------------------
-      # 11. Keep alive
+      # 9. Keep alive
       # ---------------------------------------------------------------
       - name: Keep Alive
         shell: powershell
         if: always()
         run: |
-          $endTime = (Get-Date).AddHours(6)
+          $endTime = (Get-Date).AddHours(5).AddMinutes(40)
           while ((Get-Date) -lt $endTime) {
             Start-Sleep -Seconds 60
           }
