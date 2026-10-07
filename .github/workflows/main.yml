@@ -13,49 +13,255 @@ on:
           - windows-2022
           - windows-2019
 
+permissions:
+  contents: read
+
+concurrency:
+  group: rdp-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   secure-rdp:
     runs-on: ${{ github.event.inputs.windows_version }}
     timeout-minutes: 360
 
+    env:
+      MT5_SYMBOL: XAUUSD
+      MT5_PERIOD: M1
+
     steps:
+      # ---------------------------------------------------------------
+      # 1. Checkout repo (needed so the EA file is available)
+      # ---------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------
+      # 2. Create local RDP user
+      # ---------------------------------------------------------------
       - name: System Preparation
         shell: powershell
+        env:
+          RDP_USER: ${{ secrets.RDP_USERNAME }}
+          RDP_PASS: ${{ secrets.RDP_PASSWORD }}
         run: |
-          # Use single quotes to prevent PowerShell from interpreting special characters
-          $user = '${{ secrets.RDP_USERNAME }}'
-          $pass = '${{ secrets.RDP_PASSWORD }}'
-          
-          # Convert to secure string using the variables
+          $user = $env:RDP_USER
+          $pass = $env:RDP_PASS
+
+          if (-not $user -or -not $pass) {
+            throw "RDP_USERNAME / RDP_PASSWORD secrets are not set."
+          }
+
           $securePass = ConvertTo-SecureString $pass -AsPlainText -Force
-          
-          # Check and create user safely
+
           if (-not (Get-LocalUser -Name $user -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name $user -Password $securePass -Description "RDP Access User"
+            New-LocalUser -Name $user -Password $securePass `
+              -Description "RDP Access User" -PasswordNeverExpires
+          }
+
+          if (-not (Get-LocalGroupMember -Group "Administrators" -Member $user -ErrorAction SilentlyContinue)) {
             Add-LocalGroupMember -Group "Administrators" -Member $user
           }
-          
-          # Correct way to set Environment Variables without parsing errors
+
           "RDP_USERNAME=$user" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Install Tailscale
+      # ---------------------------------------------------------------
+      # 3. Enable RDP, scoped to Tailscale CGNAT range only
+      # ---------------------------------------------------------------
+      - name: Enable RDP
         shell: powershell
         run: |
-          $installerPath = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="gh-rdp-${{ github.run_id }}"
-          $tsIp = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-          "TAILSCALE_IP=$tsIp" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' -Value 0
 
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" | Disable-NetFirewallRule
+
+          New-NetFirewallRule -Name "RDP-Tailscale" -DisplayName "RDP over Tailscale" `
+            -Enabled True -Direction Inbound -Protocol TCP -Action Allow `
+            -LocalPort 3389 -RemoteAddress 100.64.0.0/10
+
+      # ---------------------------------------------------------------
+      # 4. Install Tailscale and join the tailnet
+      # ---------------------------------------------------------------
+      - name: Install Tailscale
+        shell: powershell
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if (-not $env:TS_AUTHKEY) { throw "TAILSCALE_AUTH_KEY secret is not set." }
+
+          $msi = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $msi
+          Start-Process msiexec.exe -ArgumentList "/i","`"$msi`"","/quiet","/norestart" -Wait
+
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $ts up --authkey=$env:TS_AUTHKEY --hostname="gh-rdp-${{ github.run_id }}" --ephemeral
+
+          $tsIp = (& $ts ip -4 | Select-Object -First 1).Trim()
+          "TAILSCALE_IP=$tsIp" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Connect to: $tsIp (user: $env:RDP_USERNAME)"
+
+      # ---------------------------------------------------------------
+      # 5. Install MT5 in portable mode at C:\MT5
+      # ---------------------------------------------------------------
       - name: Install MT5
         shell: powershell
         run: |
-          Invoke-WebRequest -Uri "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe" -OutFile "$env:TEMP\mt5setup.exe"
-          Start-Process -FilePath "$env:TEMP\mt5setup.exe" -ArgumentList "/auto" -Wait
+          $installer = "$env:TEMP\mt5setup.exe"
+          Invoke-WebRequest -Uri "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe" -OutFile $installer
+          Start-Process -FilePath $installer -ArgumentList "/auto","/path:`"C:\MT5`"" -Wait
 
+          if (-not (Test-Path "C:\MT5\terminal64.exe")) {
+            throw "MT5 install failed - terminal64.exe not found."
+          }
+          "MT5_PATH=C:\MT5" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # ---------------------------------------------------------------
+      # 6. Block MT5 auto-update popup
+      #    (must run BEFORE MT5 is launched)
+      # ---------------------------------------------------------------
+      - name: Block MT5 Auto-Update
+        shell: powershell
+        run: |
+          $deny = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            "Everyone", "Write", "Deny")
+
+          function Block-Path($p) {
+            if (Test-Path $p) {
+              if ((Get-Item $p).PSIsContainer) {
+                Remove-Item "$p\*" -Recurse -Force -ErrorAction SilentlyContinue
+                Remove-Item $p -Force -ErrorAction SilentlyContinue
+              }
+            }
+            New-Item -ItemType File -Path $p -Force | Out-Null
+            $acl = Get-Acl $p
+            $acl.SetAccessRuleProtection($true, $false)
+            $acl.AddAccessRule($deny)
+            Set-Acl -Path $p -AclObject $acl
+          }
+
+          Block-Path "$env:APPDATA\MetaQuotes\WebInstall"
+          Block-Path "$env:MT5_PATH\liveupdate"
+
+          Write-Host "MT5 auto-update blocked."
+
+      # ---------------------------------------------------------------
+      # 7. Install EA into the portable data folder
+      #    Source: file committed to this repo at ea/MyEA.ex5
+      #    (See notes below to swap for a Release asset download.)
+      # ---------------------------------------------------------------
+      - name: Install EA
+        shell: powershell
+        run: |
+          $src = "ea\MyEA.ex5"
+          if (-not (Test-Path $src)) {
+            throw "EA not found in repo at $src - commit your compiled .ex5 there."
+          }
+
+          $dstDir = "$env:MT5_PATH\MQL5\Experts"
+          New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
+          Copy-Item $src -Destination $dstDir -Force
+
+          Write-Host "EA installed at $dstDir\MyEA.ex5"
+
+      # ---------------------------------------------------------------
+      # 8. Create auto-login config (UTF-16 LE) + enable AutoTrading
+      # ---------------------------------------------------------------
+      - name: Create MT5 Config
+        shell: powershell
+        env:
+          MT5_LOGIN:    ${{ secrets.MT5_LOGIN }}
+          MT5_PASSWORD: ${{ secrets.MT5_PASSWORD }}
+          MT5_SERVER:   ${{ secrets.MT5_SERVER }}
+        run: |
+          if (-not $env:MT5_LOGIN -or -not $env:MT5_PASSWORD -or -not $env:MT5_SERVER) {
+            throw "MT5_LOGIN / MT5_PASSWORD / MT5_SERVER secrets are not set."
+          }
+
+          $configDir = "$env:MT5_PATH\config"
+          New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+
+          # --- auto.ini : login + EA launch ---
+          $autoIni = "$configDir\auto.ini"
+          $lines = @(
+            "[Common]"
+            "Login=$env:MT5_LOGIN"
+            "Password=$env:MT5_PASSWORD"
+            "Server=$env:MT5_SERVER"
+            "AutoConfiguration=false"
+            ""
+            "[StartUp]"
+            "Expert=Experts\MyEA.ex5"
+            "Symbol=$env:MT5_SYMBOL"
+            "Period=$env:MT5_PERIOD"
+          )
+          Set-Content -Path $autoIni -Value $lines -Encoding Unicode
+
+          # --- common.ini : enable AutoTrading ---
+          $commonIni = "$configDir\common.ini"
+          @(
+            "[Experts]"
+            "AllowLiveTrading=1"
+            "Enabled=1"
+          ) | Set-Content -Path $commonIni -Encoding Unicode
+
+          "MT5_CONFIG=$autoIni" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Config written to $autoIni"
+
+      # ---------------------------------------------------------------
+      # 9. Launch MT5 with /portable /skipupdate /config:
+      # ---------------------------------------------------------------
+      - name: Launch MT5
+        shell: powershell
+        run: |
+          $exe = "$env:MT5_PATH\terminal64.exe"
+          if (-not (Test-Path $exe)) { throw "terminal64.exe not found at $exe" }
+
+          Start-Process -FilePath $exe `
+            -ArgumentList "/portable","/skipupdate","/config:`"$env:MT5_CONFIG`"" `
+            -WorkingDirectory $env:MT5_PATH
+
+          Start-Sleep -Seconds 30
+
+          if (-not (Get-Process terminal64 -ErrorAction SilentlyContinue)) {
+            throw "MT5 failed to start."
+          }
+          Write-Host "MT5 launched with config $env:MT5_CONFIG"
+
+      # ---------------------------------------------------------------
+      # 10. Verify EA attached + symbol accepted (fail loud, not silent)
+      # ---------------------------------------------------------------
+      - name: Verify EA Attached
+        shell: powershell
+        run: |
+          Start-Sleep -Seconds 60
+
+          $logDir = "$env:MT5_PATH\MQL5\Logs"
+          if (-not (Test-Path $logDir)) {
+            throw "No MT5 MQL5 logs yet - terminal may not have started."
+          }
+
+          $latest = Get-ChildItem $logDir -Filter *.log |
+                    Sort-Object LastWriteTime -Descending |
+                    Select-Object -First 1
+
+          Write-Host "----- $($latest.Name) (last 40 lines) -----"
+          Get-Content $latest.FullName -Tail 40
+
+          $content = Get-Content $latest.FullName -Raw
+          if ($content -match "unknown symbol|cannot find|not found") {
+            throw "MT5 rejected symbol '$env:MT5_SYMBOL'. Check broker suffix (e.g. XAUUSD.a, XAUUSDm)."
+          }
+
+          Write-Host "EA verification passed."
+
+      # ---------------------------------------------------------------
+      # 11. Keep alive until job timeout
+      # ---------------------------------------------------------------
       - name: Keep Alive
         shell: powershell
         run: |
           $endTime = (Get-Date).AddHours(6)
-          while ((Get-Date) -lt $endTime) { Start-Sleep -Seconds 60 }
+          while ((Get-Date) -lt $endTime) {
+            Start-Sleep -Seconds 60
+          }
